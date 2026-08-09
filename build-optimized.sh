@@ -10,6 +10,16 @@
 # through the CFLAGS environment variable, which programs/Makefile and
 # lib/Makefile fold into USERCFLAGS and also use at link time.
 #
+# PGO profile matching: build/make/multiconf.make caches objects under
+# cachedObjs/<md5-of-flags>/, and gcc names .gcda files after the object
+# path.  Stage 1 (-fprofile-generate) and stage 3 (-fprofile-use) use
+# different CFLAGS, hence different hashes and object paths, so stage 3
+# would find no profiles (12 -Wmissing-profile warnings, no PGO applied).
+# Fix: override the makefile's HASH_FUNC variable on the command line
+# (make ... HASH_FUNC=pgo) so both stages compile at the identical object
+# path cachedObjs/pgo/*.o and the .gcda lookups match.  The script verifies
+# this by requiring zero missing-profile diagnostics in the stage-3 log.
+#
 # Output: optimized CLI at /home/ksen/LZ4-ks/lz4 (copied from programs/lz4)
 #         optimized libs (liblz4.a, liblz4.so*) in /home/ksen/LZ4-ks/lib
 set -eu
@@ -48,8 +58,10 @@ echo "=== Stage 1/3: instrumented build (-fprofile-generate) ==="
 rm -rf "$PGODIR"
 mkdir -p "$PGODIR"
 make -C "$REPO" clean > /dev/null
+# HASH_FUNC=pgo pins the object cache directory to cachedObjs/pgo/ for both
+# PGO stages so the .gcda file names (derived from object paths) match.
 CFLAGS="$NATIVE -fprofile-generate=$PGODIR" \
-    make -C "$REPO/programs" -j"$JOBS" lz4-release
+    make -C "$REPO/programs" -j"$JOBS" lz4-release HASH_FUNC=pgo
 
 echo "=== Stage 2/3: PGO training run ==="
 for f in $CORPORA; do
@@ -58,17 +70,27 @@ done
 
 echo "=== Stage 3/3: optimized rebuild (-fprofile-use) ==="
 make -C "$REPO" clean > /dev/null
+STAGE3_LOG="$REPO/stage3-build.log"
 CFLAGS="$NATIVE -fprofile-use=$PGODIR -fprofile-correction" \
-    make -C "$REPO/programs" -j"$JOBS" lz4-release
+    make -C "$REPO/programs" -j"$JOBS" lz4-release HASH_FUNC=pgo 2>&1 \
+    | tee "$STAGE3_LOG"
+if grep -q "missing-profile" "$STAGE3_LOG"; then
+    echo "ERROR: stage 3 emitted -Wmissing-profile diagnostics; PGO profiles" >&2
+    echo "did not match the stage-3 object paths. Aborting." >&2
+    exit 1
+fi
+echo "PGO verified: zero -Wmissing-profile diagnostics in stage 3."
+rm -f "$STAGE3_LOG"
 
-# Optimized libraries. The CLI training profiles do not match the lib object
-# paths, so the libs are built with the same native+LTO flags (measured equal
-# within noise for the library code) plus -fprofile-use where gcc can match.
-CFLAGS="$NATIVE -fprofile-use=$PGODIR -fprofile-correction -Wno-missing-profile" \
-    make -C "$REPO/lib" -j"$JOBS" all
+# Libraries: the CLI training profiles are named after the CLI object paths
+# and cannot match the lib build's own object paths, so the libraries get no
+# PGO (training them would require an instrumented library consumer).  They
+# are built honestly with native+LTO only.
+CFLAGS="$NATIVE" make -C "$REPO/lib" -j"$JOBS" all
 
 cp -f "$REPO/programs/lz4" "$REPO/lz4"
 rm -f "$REPO/pgo-train.sample"
+rm -rf "$PGODIR"
 
 echo ""
 echo "Optimized binary: $REPO/lz4"
