@@ -246,6 +246,13 @@ only the latest one will be applied.
 * `-i#`:
   Minimum evaluation time in seconds \[1-9\] (default : 3)
 
+* `--mt`:
+  Benchmark using multiple threads.
+  Same as `-T0`: number of threads is automatically determined
+  from nb of detected cores.
+  Benchmark mode remains single-threaded unless
+  `-T#`, `--threads=#` or `--mt` is explicitly set.
+
 
 ### Environment Variables
 

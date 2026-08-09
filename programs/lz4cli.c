@@ -176,6 +176,9 @@ static int usage_advanced(const char* exeName)
     DISPLAY( " -b#    : benchmark file(s), using # compression level (default : 1) \n");
     DISPLAY( " -e#    : test all compression levels from -bX to # (default : 1)\n");
     DISPLAY( " -i#    : minimum evaluation time in seconds (default : 3s) \n");
+#if LZ4IO_MULTITHREAD
+    DISPLAY( "--mt    : benchmark using multiple threads (same as -T0: auto) \n");
+#endif
     if (g_lz4c_legacy_commands) {
         DISPLAY( "Legacy arguments : \n");
         DISPLAY( " -c0    : fast compression \n");
@@ -492,6 +495,7 @@ int main(int argCount, const char** argv)
                 if (!strcmp(argument,  "--keep")) { LZ4IO_setRemoveSrcFile(prefs, 0); continue; }   /* keep source file (default) */
                 if (!strcmp(argument,  "--rm")) { LZ4IO_setRemoveSrcFile(prefs, 1); continue; }
 
+                if (!strcmp(argument,  "--mt")) { nbWorkers = 0; nbWorkersSet = 1; continue; }  /* auto number of threads (same as -T0) */
                 if (longCommandWArg(&argument, "--threads")) {
                     NEXT_UINT32(nbWorkers);
                     nbWorkersSet = 1;
