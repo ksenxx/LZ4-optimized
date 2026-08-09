@@ -192,3 +192,67 @@ pigz 2.75, pzstd 2.88, zstd 2.89. enwik8 x8 shows the same pattern.
   win the file-CLI compression race at >=16 threads, and pzstd's parallel
   file decode beats LZ4's single-threaded CLI decode. LZ4's ratio (2.10) is
   lower than gzip/zstd (~2.8-2.9) by design.
+
+## File-mode MT scaling fix: parallel chunk reads (2026-08-09)
+
+The ~2 GB/s file-CLI plateau noted above is fixed. Root cause (perf-profiled:
+only ~5 of 16 cores busy at -T16): `LZ4IO_readAndProcess` was a
+self-resubmitting serial job in the same thread pool as compression
+(fresh 4 MB malloc -> fread -> serial XXH32 -> re-queue behind compress jobs).
+
+Fix (commits a0f751f + 8354921, programs/lz4io.c only):
+
+- For seekable regular files with independent blocks (POSIX), each
+  compression job pread()s its own 4 MB chunk into a pooled buffer
+  (EINTR/short-read safe), eliminating the serial read chain.
+- The frame content checksum (XXH32, inherently sequential) runs off the
+  read path through an ordered "HashGate" turnstile; a 12-worker clamp
+  applies only to fast levels (< LZ4HC_CLEVEL_MIN), where extra workers
+  merely contend with the serial hasher for DRAM bandwidth.
+- Serial path fully preserved for stdin/pipes, -BD (dependent blocks),
+  legacy format, Windows, unknown stream position, and default (no -T).
+- Output remains byte-identical to the pre-fix binary in every mode.
+
+### Wall clock, `lz4 -1 -T# -c silesia8.tar > /dev/null` (1.7 GB tmpfs, best of 3)
+
+| Threads | before (MB/s) | after (MB/s) | change |
+|---|---|---|---|
+| 1  | 415  | 399-413 | noise |
+| 8  | 2047 | 2888-2995 | +41-46% |
+| 16 | 1972 | 3515-3675 | +78-86% |
+| 32 | 1902 | 3594-3675 | +89-93% |
+
+HC `-9 -T32`: 552 MB/s vs 532 MB/s pre-fix (clamp exempted for HC).
+New honest ceiling: the sequential XXH32 frame checksum itself (~3.7 GB/s
+under pipeline load; `--no-frame-crc` reaches 6.4-8.1 GB/s, proving nothing
+else limits scaling). 4 GB/s with the default checksum is physically
+unreachable on this machine; multi-frame output or disabling the checksum
+would change the output and were rejected as cheating.
+
+### Competitive re-benchmark at 16-32 threads (interleaved best-of-3, same session)
+
+| Tool | T16 (MB/s) | T32 (MB/s) |
+|---|---|---|
+| lz4 -1 -T# (fixed) | 3594-3675 | 3594-3675 |
+| pzstd -1 -p# | 2695-2741 | 2788-2888 |
+| zstd -1 -T#  | 2488-2608 | 2651-2940 |
+
+lz4 now wins the file-CLI compression race at 16 and 32 threads by 22-44%
+(previously it lost, plateauing at ~2 GB/s vs their ~3.3 GB/s).
+
+### Verification record
+
+- Byte-identity vs pre-fix reference binary: 3 reference md5s + 712-case
+  breaker oracle matrix + 105-case post-fix spot matrix, all PASS.
+- Adversarial breaker (claude-fable-5): boundary sizes, seekable stdin,
+  >4 GB files, 8 concurrent instances, fd/VM exhaustion, /proc files,
+  truncate/append-during-compression races; ASan/UBSan/TSan clean.
+  Found 1 critical bug (SIGBUS on mid-compression truncation via the
+  original mmap read path).
+- Read-only review (gpt-5.6-sol): found 4 more real defects (nonzero-offset
+  stdin silent corruption, HC clamp regression, EINTR handling, MAP_ANONYMOUS
+  portability). All 5 fixed at root cause in 8354921; re-review of 8354921:
+  fixes 2-5 OK, the one flagged residual (--content-size + pre-seeked stdin)
+  empirically does not reproduce (CLI already refuses size detection for
+  stdin; identical warning + valid frame on both binaries).
+- `make -C tests test-lz4-basic` passes; working tree clean.
