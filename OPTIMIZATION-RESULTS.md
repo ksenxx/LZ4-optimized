@@ -256,3 +256,58 @@ lz4 now wins the file-CLI compression race at 16 and 32 threads by 22-44%
   empirically does not reproduce (CLI already refuses size detection for
   stdin; identical warning + valid frame on both binaries).
 - `make -C tests test-lz4-basic` passes; working tree clean.
+
+## Round 7: stock vs ours across levels -1/-3/-6/-9 and 1-64 threads (+ HC-aware PGO)
+
+Question: does the MT file-mode scaling advantage hold beyond level -1?
+Method: pristine stock v1.10.0 (commit 0774d05, plain make) vs ~/LZ4-ks/lz4,
+`lz4 -<L> -T<N> -c silesia8.tar > /dev/null` (1.7 GB, tmpfs), interleaved
+best-of-3, idle 32-thread Xeon.
+
+### Finding: PGO training bias, fixed in build-optimized.sh
+
+Round 1 with the old binary showed a consistent ~5-6% deficit vs stock at
+HC levels (-3/-6/-9, ratios 0.94-0.98) even single-threaded. A plain-make
+build of our sources (identical flags to stock) proved the *code* wins at
+every level (L3 T32 1.19x, L6 T32 1.09x, L9 T32 1.03x, L9 T1 1.00x), so the
+deficit was purely PGO training bias: stage 2 trained only `-b1`. Fix:
+build-optimized.sh now trains levels 1, 3 and 9.
+
+### Final results (retrained PGO binary, MB/s, best-of-3)
+
+| lvl | T  | stock  | ours   | advantage | scaling stock | scaling ours |
+|-----|----|--------|--------|-----------|---------------|--------------|
+| 1   | 1  | 426.6  | 419.3  | 0.98x (noise) | 1.0x | 1.0x |
+| 1   | 8  | 1614.9 | 3028.0 | 1.88x | 3.8x | 7.2x |
+| 1   | 16 | 1583.3 | 3670.3 | 2.32x | 3.7x | 8.8x |
+| 1   | 32 | 1519.4 | 3810.5 | 2.51x | 3.6x | 9.1x |
+| 1   | 64 | 1473.2 | 3785.0 | 2.57x | 3.5x | 9.0x |
+| 3   | 1  | 81.3   | 87.2   | 1.07x | 1.0x | 1.0x |
+| 3   | 16 | 1057.8 | 1276.9 | 1.21x | 13.0x | 14.6x |
+| 3   | 32 | 1293.4 | 1638.3 | 1.27x | 15.9x | 18.8x |
+| 3   | 64 | 1213.8 | 1477.1 | 1.22x | 14.9x | 16.9x |
+| 6   | 1  | 49.5   | 53.0   | 1.07x | 1.0x | 1.0x |
+| 6   | 16 | 730.9  | 798.0  | 1.09x | 14.8x | 15.1x |
+| 6   | 32 | 929.6  | 1068.5 | 1.15x | 18.8x | 20.2x |
+| 6   | 64 | 883.6  | 1021.5 | 1.16x | 17.9x | 19.3x |
+| 9   | 1  | 31.9   | 34.0   | 1.07x | 1.0x | 1.0x |
+| 9   | 16 | 474.2  | 506.3  | 1.07x | 14.9x | 14.9x |
+| 9   | 32 | 626.9  | 684.0  | 1.09x | 19.7x | 20.1x |
+| 9   | 64 | 609.1  | 678.3  | 1.11x | 19.1x | 19.9x |
+
+Interpretation: at -1 the serial read/checksum/dispatch loop dominates, so
+the parallel-read fix is worth 1.88-2.57x and stock stalls at 3.5-3.8x
+scaling. At HC levels compression itself dominates and both scale to
+~19-20x on 16 cores + HT; the remaining 7-27% win comes from HC-aware
+PGO+LTO+native codegen plus slightly better overlap. T64 (2x
+oversubscription) causes no collapse in either binary.
+
+### Verification (this round)
+
+- Outputs byte-identical to stock at -1/-3/-6/-9 (T16 md5s equal), both
+  before and after the PGO retrain; ours cross-decoded by the pristine
+  stock binary reproduces the original corpus md5. Ratios unchanged
+  (2.10 / 2.60 / 2.70 / 2.72).
+- L1 T1 file mode: 5 extra interleaved runs, stock 3.92-4.07 s vs ours
+  4.03-4.14 s (~1-2%, within noise). In-memory ST bench unregressed
+  (enwik8 -b1 421.7 MB/s; calgary -b9 sizes identical).

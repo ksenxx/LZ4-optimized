@@ -64,8 +64,13 @@ CFLAGS="$NATIVE -fprofile-generate=$PGODIR" \
     make -C "$REPO/programs" -j"$JOBS" lz4-release HASH_FUNC=pgo
 
 echo "=== Stage 2/3: PGO training run ==="
+# Train both the fast path (-b1) and the HC path (-b3, -b9): profiles trained
+# on level 1 alone were measured to cost ~5-6% at HC levels (-3/-6/-9)
+# because the HC hot loops got no branch/inline guidance.
 for f in $CORPORA; do
-    "$REPO/programs/lz4" -b1 -i1 "$f" > /dev/null
+    for lvl in 1 3 9; do
+        "$REPO/programs/lz4" -b"$lvl" -i1 "$f" > /dev/null
+    done
 done
 
 echo "=== Stage 3/3: optimized rebuild (-fprofile-use) ==="
