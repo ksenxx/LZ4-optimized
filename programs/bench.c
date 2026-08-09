@@ -428,7 +428,18 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                         const char* dictBuf, int dictSize)
 {
 #if LZ4IO_MULTITHREAD
-    int const nbWorkers = (g_nbWorkers > 1 && !g_decodeOnly) ? g_nbWorkers : 1;
+    /* BENCH_MT_MIN_SRCSIZE : below this input size, the thread pool is bypassed
+     * even when -T is requested. Rationale : every benchmark loop iteration in
+     * MT mode pays TPool_submitJob() + TPool_jobsCompleted() synchronization
+     * (~microseconds of mutex/condvar work), while the initial calibration
+     * derives up to millions of loop iterations from a small srcSize (see
+     * nbCompressionLoops / nbDecodeLoops below). For tiny inputs this overhead
+     * exceeds the useful work by >1000x (a 1-byte bench would take hours).
+     * At >= 1 MB, real (de)compression work per loop is large enough to
+     * amortize the pool synchronization cost. */
+#  define BENCH_MT_MIN_SRCSIZE (1 MB)
+    int const requestedWorkers = (g_nbWorkers > 1 && !g_decodeOnly) ? g_nbWorkers : 1;
+    int nbWorkers = (requestedWorkers > 1 && srcSize >= (size_t)BENCH_MT_MIN_SRCSIZE) ? requestedWorkers : 1;
 #else
     int const nbWorkers = 1;
 #endif
@@ -491,6 +502,12 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
     }   }   }
 
 #if LZ4IO_MULTITHREAD
+    /* Use the thread pool only when it can actually help :
+     * never more workers than blocks; with a single block (or none), fall back
+     * to the plain single-threaded loop (which also selects the single-threaded
+     * output format below). */
+    if (nbWorkers > (int)nbBlocks) nbWorkers = nbBlocks ? (int)nbBlocks : 1;
+
     /* Multithread init : one thread pool + one compression state per worker */
     if (nbWorkers > 1) {
         int w;
@@ -561,8 +578,18 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
             TIME_waitForNextTick();
 
             if (!cCompleted) {   /* still some time to do compression tests */
-                TIME_t const timeStart = TIME_getTime();
+                TIME_t timeStart;
                 U32 nbLoops;
+#if LZ4IO_MULTITHREAD
+                if (nbWorkers > 1) {
+                    /* reset per-phase error state : errorBlock is shared with
+                     * the decompression phase; a stale value would be
+                     * misattributed to the wrong phase */
+                    int w;
+                    for (w=0; w<nbWorkers; w++) workerCtx[w].errorBlock = -1;
+                }
+#endif
+                timeStart = TIME_getTime();
                 for (nbLoops=0; nbLoops < nbCompressionLoops; nbLoops++) {
 #if LZ4IO_MULTITHREAD
                     if (nbWorkers > 1) {
@@ -635,9 +662,18 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                     LZ4F_decompress_binding : LZ4_decompress_safe_usingDict;
                 const char* const decString = g_decodeOnly ?
                     "LZ4F_decompress" : "LZ4_decompress_safe_usingDict";
-                TIME_t const timeStart = TIME_getTime();
+                TIME_t timeStart;
                 U32 nbLoops;
-
+#if LZ4IO_MULTITHREAD
+                if (nbWorkers > 1) {
+                    /* reset per-phase error state : errorBlock is shared with
+                     * the compression phase; a stale value would be
+                     * misattributed to the wrong phase */
+                    int w;
+                    for (w=0; w<nbWorkers; w++) workerCtx[w].errorBlock = -1;
+                }
+#endif
+                timeStart = TIME_getTime();
                 for (nbLoops=0; nbLoops < nbDecodeLoops; nbLoops++) {
                     U32 blockNb;
 #if LZ4IO_MULTITHREAD
