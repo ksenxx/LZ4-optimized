@@ -404,6 +404,7 @@ int main(int argCount, const char** argv)
         operationResult=0,
         contentSizeFlag=0;
     unsigned nbWorkers = init_nbWorkers();
+    int nbWorkersSet = 0;
     operationMode_e mode = om_auto;
     const char* input_filename = NULL;
     const char* output_filename= NULL;
@@ -493,6 +494,7 @@ int main(int argCount, const char** argv)
 
                 if (longCommandWArg(&argument, "--threads")) {
                     NEXT_UINT32(nbWorkers);
+                    nbWorkersSet = 1;
                     continue;
                 }
                 if (longCommandWArg(&argument, "--fast")) {
@@ -558,6 +560,7 @@ int main(int argCount, const char** argv)
                 case 'T':
                     {   argument++;
                         nbWorkers = readU32FromChar(&argument);
+                        nbWorkersSet = 1;
                         argument--;
                     }
                     break;
@@ -756,6 +759,17 @@ int main(int argCount, const char** argv)
     /* benchmark and test modes */
     if (mode == om_bench) {
         BMK_setNotificationLevel(displayLevel);
+        /* bench mode runs single-threaded unless -T# is set explicitly; -T0 means "auto" */
+        if (nbWorkersSet) {
+            if (nbWorkers == 0)
+                nbWorkers = (unsigned)LZ4IO_defaultNbWorkers();
+            if (nbWorkers > LZ4_NBWORKERS_MAX) {
+                DISPLAYLEVEL(3, "Requested %u threads too large => automatically reduced to %u \n",
+                            nbWorkers, LZ4_NBWORKERS_MAX);
+                nbWorkers = LZ4_NBWORKERS_MAX;
+            }
+            BMK_setNbWorkers((int)nbWorkers);
+        }
         operationResult = BMK_benchFiles(inFileNames, ifnIdx, cLevel, cLevelLast, dictionary_filename);
         goto _cleanup;
     }
