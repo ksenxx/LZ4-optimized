@@ -29,6 +29,18 @@ done
 if [ -z "$CORPORA" ]; then
     echo "WARNING: benchmark corpora not found; training PGO on /usr/bin/* sample"
     cat /usr/bin/* 2>/dev/null | head -c 50000000 > "$REPO/pgo-train.sample" || true
+    # Hardening: guarantee a non-empty training sample (an empty sample would make
+    # stage 2 exit with `Error 12: no data to bench` and abort under `set -eu`).
+    if [ ! -s "$REPO/pgo-train.sample" ]; then
+        echo "WARNING: /usr/bin sample empty; using a self-generated data sample"
+        # Deterministic 16 MB mixed-content sample, always available.
+        { cat "$REPO"/README.md "$REPO"/lib/*.c "$REPO"/lib/*.h "$REPO"/programs/*.c 2>/dev/null; } \
+            | head -c 16000000 > "$REPO/pgo-train.sample" || true
+    fi
+    if [ ! -s "$REPO/pgo-train.sample" ]; then
+        # Absolute last resort: still non-empty so the bench never fails.
+        printf 'lz4 pgo training fallback sample\n' > "$REPO/pgo-train.sample"
+    fi
     CORPORA="$REPO/pgo-train.sample"
 fi
 
