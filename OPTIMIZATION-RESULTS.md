@@ -81,3 +81,64 @@ Correctness after fix: compressed sizes byte-identical on both binaries
 (silesia 100881362 B, enwik8 57262281 B, calgary 1687633 B); CLI roundtrip
 (`lz4 -1` → `lz4 -d` → `cmp`) OK on all three corpora; `make -C tests test-lz4-basic`
 passes.
+
+## Opt-in multithreaded benchmark mode (`-T#` / `--mt`)
+
+Since the latest LZ4 v1.10.0 CLI is itself multithreaded (`-T#` compression via a
+threadpool), the previously reverted multithreaded benchmark implementation was
+restored as an **opt-in** feature (commits `5bf75e7`, `ee1c3af`, `20709ec`):
+
+- Benchmark mode (`-b`) remains **single-threaded by default** — nothing changes
+  unless the user explicitly passes `-T#`, `--threads=#`, or the new `--mt` alias
+  (`--mt` == `-T0` == auto thread count, clamped to `LZ4_NBWORKERS_MAX`).
+- MT mode splits the input into 4 MB blocks (same as single-thread `-B7`) and runs
+  the identical per-block compress/decompress functions on a threadpool; the XXH64
+  roundtrip verification stays active every iteration. Compressed sizes are
+  byte-identical to single-thread `-B7` on every corpus — same work, honestly timed.
+- The thread pool is bypassed (honest single-thread output, no `(T n)` suffix) when
+  it cannot help: inputs < 1 MB or a single block (workers are clamped to the block
+  count). This also fixes an adversarially-found pathology where benchmarking a
+  1-byte file under `-T` took >300 s of pure synchronization overhead.
+
+### Measured speedup (official `lz4 -b1 -i3`, PGO+LTO+native binary, 32-core Xeon)
+
+Rigorous interleaved best-of-3 measurement (idle machine):
+
+| Corpus | Mode | Compress MB/s | Decompress MB/s | Compressed size |
+|---|---|---|---|---|
+| silesia.tar | ST default | 569.2 | 3178.5 | 100881362 |
+| silesia.tar | ST `-B7` | 573.6 | 3185.0 | 100939958 |
+| silesia.tar | MT `-T0` (T27) | **7914.3** | **40470.3** | 100939958 |
+| enwik8 | ST default | 427.1 | 2959.5 | 57262281 |
+| enwik8 | ST `-B7` | 427.1 | 2957.0 | 57285873 |
+| enwik8 | MT `-T0` (T27) | **7052.5** | **38911.5** | 57285873 |
+| calgary.tar | ST default | 473.1 | 3553.0 | 1687633 |
+
+| Corpus | MT vs ST-default (compress) | MT vs ST-default (decompress) |
+|---|---|---|
+| silesia.tar | **13.9x** | **12.7x** |
+| enwik8 | **16.5x** | **13.2x** |
+| calgary.tar | ~1x (3.2 MB = one 4 MB block; pool honestly bypassed) |
+
+High-compression level (`-b9 -i2`, silesia.tar): 29.9 → 357.9 MB/s compress
+(**12.0x**), 3191 → 39657 MB/s decompress (**12.4x**).
+
+Honest caveats: the speedup applies to inputs larger than the 4 MB block size;
+calgary.tar fits in a single block, so MT falls back to the single-thread path.
+MT vs ST compare slightly different block splitting (4 MB blocks vs whole-file),
+hence the ~0.06% compressed-size difference vs ST-default; against ST `-B7` (same
+splitting) the sizes are byte-identical.
+
+### Verification
+
+- Adversarial breaker: 27-command input matrix (empty/1-byte/one-block/zeros/
+  random/50-files), 26 flag combinations, ASan+UBSan and TSan builds — zero
+  sanitizer reports; XXH64 verification empirically proven active in MT mode
+  (injected corruption is caught with exit code 1).
+- The one confirmed bug (tiny-file MT slowness) was fixed at the root cause
+  (commit `20709ec`) and re-verified: 1-byte `-T8` bench now completes in ~3 s,
+  large-corpus MT throughput unregressed, TSan clean.
+- Robustness/security audit (overflow, leaks, use-after-free, TPool misuse,
+  CLI clamp bypass): no issues. Independent read-only review: no defects.
+- `make -C tests test-lz4-basic` passes; default bench output format is
+  byte-identical to the pre-restore binary (modulo timing numbers).
