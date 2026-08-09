@@ -142,3 +142,53 @@ splitting) the sizes are byte-identical.
   CLI clamp bypass): no issues. Independent read-only review: no defects.
 - `make -C tests test-lz4-basic` passes; default bench output format is
   byte-identical to the pre-restore binary (modulo timing numbers).
+
+## Competitive benchmark vs reference parallel compressors (2026-08-09)
+
+Question: are the MT speedups competitive, or merely faster than single-threaded
+LZ4? Compared against pigz 2.8, pzstd 1.5.5 and zstd 1.5.5 (`-T#`) at equal
+thread counts on the same machine (2x Xeon 2.80 GHz, 16 physical cores / 32 HT).
+All tools at their fastest level (-1). All outputs decompressed and md5-verified
+against the originals (8/8 integrity checks passed).
+
+### In-memory engine comparison (official bench modes, `-b1 -i3`)
+
+silesia.tar, compression MB/s (scaling vs own T1 in parens):
+
+| Threads | LZ4 MT | zstd MT | LZ4 advantage |
+|---|---|---|---|
+| 1  | 555.5           | 348.6          | 1.59x |
+| 8  | 3478.2 (6.3x)   | 2111.3 (6.1x)  | 1.65x |
+| 16 | 5566.6 (10.0x)  | 2569.6 (7.4x)  | 2.17x |
+| 32 | 7154.5 (12.9x)  | 3106.9 (8.9x)  | 2.30x |
+
+enwik8: LZ4 408.5 -> 6680.3 MB/s (16.4x at T32) vs zstd 261.9 -> 2331.9 (8.9x);
+LZ4 advantage 1.56-2.86x at equal threads. MT LZ4 parallel decode: 18.0-36.7
+GB/s; zstd format decodes single-threaded (~0.9-1.1 GB/s regardless of -T).
+
+### File-based wall clock (tmpfs, output to /dev/null, best of 3)
+
+silesia x8 (1.7 GB), compression MB/s:
+
+| Threads | lz4 -T# | pigz | pzstd | zstd -T# |
+|---|---|---|---|---|
+| 1  | 427  | 90   | 345  | 333  |
+| 8  | 2034 | 695  | 2540 | 2401 |
+| 16 | 2024 | 1351 | 2989 | 2936 |
+| 32 | 1955 | 1314 | 3369 | 3266 |
+
+Decompression MB/s: lz4 CLI ~1725 (single-threaded decode path), pigz ~285,
+pzstd up to 8025 (parallel decode), zstd ~1020. Ratios (silesia): lz4 2.10,
+pigz 2.75, pzstd 2.88, zstd 2.89. enwik8 x8 shows the same pattern.
+
+### Verdict
+
+- The 13-16x MT bench speedups are competitive: no reference tool scales
+  better than ~15-16x on this 16-core/32-HT box (pigz ~15x, pzstd 9.8x,
+  zstd MT 8.9x), and MT LZ4's absolute engine throughput beats MT zstd
+  1.6-2.9x at every equal thread count.
+- Honest caveats: the LZ4 *file CLI* pipeline (read/dispatch/write) is
+  single-threaded around the workers and plateaus at ~2 GB/s, so pzstd/zstd
+  win the file-CLI compression race at >=16 threads, and pzstd's parallel
+  file decode beats LZ4's single-threaded CLI decode. LZ4's ratio (2.10) is
+  lower than gzip/zstd (~2.8-2.9) by design.
