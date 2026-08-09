@@ -47,8 +47,6 @@
 #include "xxhash.h"
 #include "bench.h"
 #include "timefn.h"
-#include "lz4conf.h"     /* LZ4IO_MULTITHREAD */
-#include "threadpool.h"  /* TPool */
 
 #define LZ4_STATIC_LINKING_ONLY
 #include "lz4.h"
@@ -127,7 +125,6 @@ int g_additionalParam = 0;
 int g_benchSeparately = 0;
 int g_decodeOnly = 0;
 unsigned g_skipChecksums = 0;
-static int g_nbWorkers = 1;
 
 void BMK_setNotificationLevel(unsigned level) { g_displayLevel=level; }
 
@@ -146,18 +143,6 @@ void BMK_setBenchSeparately(int separate) { g_benchSeparately = (separate!=0); }
 void BMK_setDecodeOnlyMode(int set) { g_decodeOnly = (set!=0); }
 
 void BMK_skipChecksums(int skip) { g_skipChecksums = (skip!=0); }
-
-void BMK_setNbWorkers(int nbWorkers)
-{
-    if (nbWorkers < 1) nbWorkers = 1;
-#if !LZ4IO_MULTITHREAD
-    if (nbWorkers > 1) {
-        DISPLAYLEVEL(2, "warning: this executable doesn't support multithreading; benchmarking with 1 thread \n");
-        nbWorkers = 1;
-    }
-#endif
-    g_nbWorkers = nbWorkers;
-}
 
 
 /* *************************************
@@ -372,68 +357,12 @@ typedef struct {
 #define MIN(a,b) ((a)<(b) ? (a) : (b))
 #define MAX(a,b) ((a)>(b) ? (a) : (b))
 
-#if LZ4IO_MULTITHREAD
-/* Context for one worker thread of the multithreaded benchmark.
- * Each worker owns its compression state (cparams)
- * and processes a fixed contiguous range of blocks [firstBlock, endBlock). */
-typedef struct {
-    struct compressionParameters* cparams;
-    blockParam_t* blockTable;
-    U32 firstBlock;
-    U32 endBlock;
-    const char* dictBuf;
-    int dictSize;
-    int errorBlock;   /* -1 == no error */
-} BMK_workerCtx_t;
-
-static void BMK_compressJob(void* arg)
-{
-    BMK_workerCtx_t* const ctx = (BMK_workerCtx_t*)arg;
-    U32 blockNb;
-    ctx->cparams->resetFunction(ctx->cparams);
-    for (blockNb=ctx->firstBlock; blockNb<ctx->endBlock; blockNb++) {
-        size_t const rSize = (size_t)ctx->cparams->blockFunction(
-            ctx->cparams,
-            ctx->blockTable[blockNb].srcPtr, ctx->blockTable[blockNb].cPtr,
-            (int)ctx->blockTable[blockNb].srcSize, (int)ctx->blockTable[blockNb].cRoom);
-        if (LZ4_isError(rSize)) {
-            ctx->errorBlock = (int)blockNb;
-            return;
-        }
-        ctx->blockTable[blockNb].cSize = rSize;
-    }
-}
-
-static void BMK_decompressJob(void* arg)
-{
-    BMK_workerCtx_t* const ctx = (BMK_workerCtx_t*)arg;
-    U32 blockNb;
-    for (blockNb=ctx->firstBlock; blockNb<ctx->endBlock; blockNb++) {
-        int const regenSize = LZ4_decompress_safe_usingDict(
-            ctx->blockTable[blockNb].cPtr, ctx->blockTable[blockNb].resPtr,
-            (int)ctx->blockTable[blockNb].cSize, (int)ctx->blockTable[blockNb].srcSize,
-            ctx->dictBuf, ctx->dictSize);
-        if (regenSize < 0) {
-            ctx->errorBlock = (int)blockNb;
-            return;
-        }
-        ctx->blockTable[blockNb].resSize = (size_t)regenSize;
-    }
-}
-#endif /* LZ4IO_MULTITHREAD */
-
 static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                         const char* displayName, int cLevel,
                         const size_t* fileSizes, U32 nbFiles,
                         const char* dictBuf, int dictSize)
 {
-#if LZ4IO_MULTITHREAD
-    int const nbWorkers = (g_nbWorkers > 1 && !g_decodeOnly) ? g_nbWorkers : 1;
-#else
-    int const nbWorkers = 1;
-#endif
-    size_t const defaultBlockSize = (nbWorkers > 1) ? (size_t)(4 MB) : srcSize;  /* MT requires multiple blocks to generate parallelism */
-    size_t const blockSize = (g_blockSize>=32 && !g_decodeOnly ? g_blockSize : defaultBlockSize) + (!srcSize) /* avoid div by 0 */ ;
+    size_t const blockSize = (g_blockSize>=32 && !g_decodeOnly ? g_blockSize : srcSize) + (!srcSize) /* avoid div by 0 */ ;
     U32 const maxNbBlocks = (U32)((srcSize + (blockSize-1)) / blockSize) + nbFiles;
     blockParam_t* const blockTable = (blockParam_t*) malloc(maxNbBlocks * sizeof(blockParam_t));
     size_t const maxCompressedSize = (size_t)LZ4_compressBound((int)srcSize) + (maxNbBlocks * 1024);   /* add some room for safety */
@@ -445,11 +374,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
     int benchError = 0;
     U32 nbBlocks;
     struct compressionParameters compP;
-#if LZ4IO_MULTITHREAD
-    TPool* pool = NULL;
-    struct compressionParameters* workerCParams = NULL;
-    BMK_workerCtx_t* workerCtx = NULL;
-#endif
 
     /* checks */
     if (!compressedBuffer || !resultBuffer || !blockTable)
@@ -489,29 +413,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                 resPtr += resCapa;
                 remaining -= thisBlockSize;
     }   }   }
-
-#if LZ4IO_MULTITHREAD
-    /* Multithread init : one thread pool + one compression state per worker */
-    if (nbWorkers > 1) {
-        int w;
-        pool = TPool_create(nbWorkers, nbWorkers);
-        workerCParams = (struct compressionParameters*)malloc((size_t)nbWorkers * sizeof(*workerCParams));
-        workerCtx = (BMK_workerCtx_t*)malloc((size_t)nbWorkers * sizeof(*workerCtx));
-        if (!pool || !workerCParams || !workerCtx)
-            END_PROCESS(32, "allocation error : not enough memory");
-        for (w=0; w<nbWorkers; w++) {
-            LZ4_buildCompressionParameters(&workerCParams[w], cLevel, dictBuf, dictSize);
-            workerCParams[w].initFunction(&workerCParams[w]);
-            workerCtx[w].cparams = &workerCParams[w];
-            workerCtx[w].blockTable = blockTable;
-            workerCtx[w].firstBlock = (U32)(((U64)nbBlocks * (U32)w) / (U32)nbWorkers);
-            workerCtx[w].endBlock = (U32)(((U64)nbBlocks * ((U32)w+1)) / (U32)nbWorkers);
-            workerCtx[w].dictBuf = dictBuf;
-            workerCtx[w].dictSize = dictSize;
-            workerCtx[w].errorBlock = -1;
-        }
-    }
-#endif
 
     /* warming up memory */
     memset(compressedBuffer, ' ', maxCompressedSize);
@@ -564,16 +465,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                 TIME_t const timeStart = TIME_getTime();
                 U32 nbLoops;
                 for (nbLoops=0; nbLoops < nbCompressionLoops; nbLoops++) {
-#if LZ4IO_MULTITHREAD
-                    if (nbWorkers > 1) {
-                        int w;
-                        for (w=0; w<nbWorkers; w++)
-                            TPool_submitJob(pool, BMK_compressJob, &workerCtx[w]);
-                        TPool_jobsCompleted(pool);
-                        continue;
-                    }
-#endif
-                  { U32 blockNb;
+                    U32 blockNb;
                     compP.resetFunction(&compP);
                     for (blockNb=0; blockNb<nbBlocks; blockNb++) {
                         size_t const rSize = (size_t)compP.blockFunction(
@@ -585,18 +477,7 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                             benchError =1 ;
                         }
                         blockTable[blockNb].cSize = rSize;
-                }   }   }
-#if LZ4IO_MULTITHREAD
-                if (nbWorkers > 1) {
-                    int w;
-                    for (w=0; w<nbWorkers; w++) {
-                        if (workerCtx[w].errorBlock >= 0) {
-                            DISPLAY("LZ4 compression failed on block %u \n", (unsigned)workerCtx[w].errorBlock);
-                            benchError = 1;
-                        }
-                    }
-                }
-#endif
+                }   }
                 {   Duration_ns const duration_ns = TIME_clockSpan_ns(timeStart);
                     if (duration_ns > 0) {
                         if (duration_ns < fastestC * nbCompressionLoops)
@@ -640,15 +521,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
 
                 for (nbLoops=0; nbLoops < nbDecodeLoops; nbLoops++) {
                     U32 blockNb;
-#if LZ4IO_MULTITHREAD
-                    if (nbWorkers > 1) {
-                        int w;
-                        for (w=0; w<nbWorkers; w++)
-                            TPool_submitJob(pool, BMK_decompressJob, &workerCtx[w]);
-                        TPool_jobsCompleted(pool);
-                        continue;
-                    }
-#endif
                     for (blockNb=0; blockNb<nbBlocks; blockNb++) {
                         size_t const inMaxSize = (size_t)INT_MAX / decMultiplier;
                         size_t const resCapa = (blockTable[blockNb].srcSize < inMaxSize) ?
@@ -668,19 +540,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
                         }
                         blockTable[blockNb].resSize = (size_t)regenSize;
                 }   }
-#if LZ4IO_MULTITHREAD
-                if (nbWorkers > 1) {
-                    int w;
-                    for (w=0; w<nbWorkers; w++) {
-                        if (workerCtx[w].errorBlock >= 0) {
-                            DISPLAY("%s() failed on block %u of size %u \n",
-                                decString, (unsigned)workerCtx[w].errorBlock,
-                                (unsigned)blockTable[workerCtx[w].errorBlock].srcSize);
-                            benchError = 1;
-                        }
-                    }
-                }
-#endif
                 {   Duration_ns const duration_ns = TIME_clockSpan_ns(timeStart);
                     if (duration_ns > 0) {
                         if (duration_ns < fastestD * nbDecodeLoops)
@@ -702,16 +561,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
             }
             markNb = (markNb+1) % NB_MARKS;
             ratio  = (double)totalRSize / (double)cSize;
-#if LZ4IO_MULTITHREAD
-            if (nbWorkers > 1) {
-                OUTLEVEL(2, "%2s-%-17.17s :%10u ->%10u (%5.3f),%6.1f MB/s,%7.1f MB/s (T%i)\r",
-                        marks[markNb], displayName,
-                        (U32)totalRSize, (U32)cSize, ratio,
-                        ((double)totalRSize / (double)fastestC) * 1000,
-                        ((double)totalRSize / (double)fastestD) * 1000,
-                        nbWorkers);
-            } else
-#endif
             OUTLEVEL(2, "%2s-%-17.17s :%10u ->%10u (%5.3f),%6.1f MB/s,%7.1f MB/s\r",
                     marks[markNb], displayName,
                     (U32)totalRSize, (U32)cSize, ratio,
@@ -762,16 +611,6 @@ static int BMK_benchMem(const void* srcBuffer, size_t srcSize,
     }   /* Bench */
 
     /* clean up */
-#if LZ4IO_MULTITHREAD
-    if (nbWorkers > 1) {
-        int w;
-        TPool_free(pool);
-        for (w=0; w<nbWorkers; w++)
-            workerCParams[w].cleanupFunction(&workerCParams[w]);
-        free(workerCParams);
-        free(workerCtx);
-    }
-#endif
     compP.cleanupFunction(&compP);
     free(blockTable);
     free(compressedBuffer);
